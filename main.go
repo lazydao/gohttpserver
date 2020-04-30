@@ -56,7 +56,7 @@ func (l httpLogger) Log(record accesslog.LogRecord) {
 }
 
 var (
-	defaultPlistProxy = "https://plistproxy.herokuapp.com/plist"
+	defaultPlistProxy = "https://plistzero.herokuapp.com/plist"
 	defaultOpenID     = "https://login.netease.com/openid"
 	gcfg              = Configure{}
 	logger            = httpLogger{}
