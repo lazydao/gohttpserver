@@ -1,6 +1,6 @@
 # gohttpserver
 [![Build Status](https://travis-ci.org/codeskyblue/gohttpserver.svg?branch=master)](https://travis-ci.org/codeskyblue/gohttpserver)
-[![](https://images.microbadger.com/badges/image/codeskyblue/gohttpserver.svg)](https://microbadger.com/images/codeskyblue/gohttpserver "Get your own image badge on microbadger.com")
+[![Docker Automated build](https://img.shields.io/docker/automated/codeskyblue/gohttpserver)](https://hub.docker.com/repository/docker/codeskyblue/gohttpserver)
 
 - Goal: Make the best HTTP File Server.
 - Features: Human-friendly UI, file uploading support, direct QR-code generation for Apple & Android install package.
@@ -13,7 +13,7 @@
 **Binaries** can be downloaded from [this repo releases](https://github.com/codeskyblue/gohttpserver/releases/)
 
 ## Requirements
-Tested with go-1.10, go-1.11
+Tested with go-1.16
 
 ## Screenshots
 ![screen](testdata/filetypes/gohttpserver.gif)
@@ -58,19 +58,23 @@ Tested with go-1.10, go-1.11
 1. [x] Support unzip zip file when upload(with form: unzip=true)
 
 ## Installation
-```
-go get -v github.com/codeskyblue/gohttpserver
-cd $GOPATH/src/github.com/codeskyblue/gohttpserver
-go build && ./gohttpserver
+```bash
+$ go install github.com/codeskyblue/gohttpserver@latest
 ```
 
 Or download binaries from [github releases](https://github.com/codeskyblue/gohttpserver/releases)
+
+If you are using Mac, simply run command
+
+```bash
+$ brew install codeskyblue/tap/gohttpserver
+```
 
 ## Usage
 Listen on port 8000 of all interfaces, and enable file uploading.
 
 ```
-./gohttpserver -r ./ --port 8000 --upload
+$ gohttpserver -r ./ --port 8000 --upload
 ```
 
 Use command `gohttpserver --help` to see more usage.
@@ -79,13 +83,13 @@ Use command `gohttpserver --help` to see more usage.
 share current directory
 
 ```bash
-docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver codeskyblue/gohttpserver
+$ docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver codeskyblue/gohttpserver
 ```
 
 Share current directory with http basic auth
 
 ```bash
-docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
+$ docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
   codeskyblue/gohttpserver \
   --auth-type http --auth-http username:password
 ```
@@ -93,7 +97,7 @@ docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
 Share current directory with openid auth. (Works only in netease company.)
 
 ```bash
-docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
+$ docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
   codeskyblue/gohttpserver \
   --auth-type openid
 ```
@@ -101,8 +105,8 @@ docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
 To build image yourself, please change the PWD to the root of this repo.
 
 ```bash
-cd gohttpserver/
-docker build -t codeskyblue/gohttpserver -f docker/Dockerfile .
+$ cd gohttpserver/
+$ docker build -t codeskyblue/gohttpserver -f docker/Dockerfile .
 ```
 
 ## Authentication options
@@ -126,7 +130,7 @@ docker build -t codeskyblue/gohttpserver -f docker/Dockerfile .
   You can configure to let a http reverse proxy handling authentication. 
   When using oauth2-proxy, the backend will use identification info from request headers `X-Auth-Request-Email` as userId and `X-Auth-Request-Fullname` as user's display name. 
   Please config your oauth2 reverse proxy yourself.
-  More about [oauth2-proxy](https://github.com/bitly/oauth2_proxy).
+  More about [oauth2-proxy](https://github.com/oauth2-proxy/oauth2-proxy).
   
   All required headers list as following.
 
@@ -192,8 +196,8 @@ accessTables:
 ### ipa plist proxy
 This is used for server on which https is enabled. default use <https://plistproxy.herokuapp.com/plist>
 
-```
-./gohttpserver --plistproxy=https://someproxyhost.com/
+```bash
+$ gohttpserver --plistproxy=https://someproxyhost.com/
 ```
 
 Test if proxy works:
@@ -258,6 +262,35 @@ gohttpserver should started with `--xheaders` argument when behide nginx.
 
 Refs: <http://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size>
 
+gohttpserver also support `--prefix` flag which will help to when meet `/` is occupied by other service. relative issue <https://github.com/codeskyblue/gohttpserver/issues/105>
+
+Usage example:
+
+```bash
+# for gohttpserver
+$ gohttpserver --prefix /foo --addr :8200 --xheaders
+```
+
+**Nginx settigns**
+
+```
+server {
+  listen 80;
+  server_name your-domain-name.com;
+
+  location /foo {
+    proxy_pass http://127.0.0.1:8200; # here need to change
+    proxy_redirect off;
+    proxy_set_header  Host    $host;
+    proxy_set_header  X-Real-IP $remote_addr;
+    proxy_set_header  X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header  X-Forwarded-Proto $scheme;
+
+    client_max_body_size 0; # disable upload limit
+  }
+}
+```
+
 ## FAQ
 - [How to generate self signed certificate with openssl](http://stackoverflow.com/questions/10175812/how-to-create-a-self-signed-certificate-with-openssl)
 
@@ -273,14 +306,13 @@ Depdencies are managed by [govendor](https://github.com/kardianos/govendor)
 1. Build develop version. **assets** directory must exists
 
   ```sh
-  go build
-  ./gohttpserver
+  $ go build
+  $ ./gohttpserver
   ```
 2. Build single binary release
 
   ```sh
-  go generate .
-  go build -tags vfs
+  $ go build
   ```
 
 Theme are defined in [assets/themes](assets/themes) directory. Now only two themes are available, "black" and "green".
@@ -300,7 +332,7 @@ Theme are defined in [assets/themes](assets/themes) directory. Now only two them
 
 **Go Libraries**
 
-* [vfsgen](https://github.com/shurcooL/vfsgen)
+* [vfsgen](https://github.com/shurcooL/vfsgen) Not using now
 * [go-bindata-assetfs](https://github.com/elazarl/go-bindata-assetfs) Not using now
 * <http://www.gorillatoolkit.org/pkg/handlers>
 

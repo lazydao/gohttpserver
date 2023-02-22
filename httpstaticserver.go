@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"regexp"
@@ -41,8 +42,14 @@ type IndexFileItem struct {
 	Info os.FileInfo
 }
 
+type Directory struct {
+	size  map[string]int64
+	mutex *sync.RWMutex
+}
+
 type HTTPStaticServer struct {
 	Root            string
+	Prefix          string
 	Upload          bool
 	Delete          bool
 	Title           string
@@ -53,13 +60,15 @@ type HTTPStaticServer struct {
 
 	indexes []IndexFileItem
 	m       *mux.Router
+	bufPool sync.Pool // use sync.Pool caching buf to reduce gc ratio
 }
 
 func NewHTTPStaticServer(root string) *HTTPStaticServer {
-	if root == "" {
-		root = "./"
-	}
-	root = filepath.ToSlash(root)
+	// if root == "" {
+	// 	root = "./"
+	// }
+	// root = filepath.ToSlash(root)
+	root = filepath.ToSlash(filepath.Clean(root))
 	if !strings.HasSuffix(root, "/") {
 		root = root + "/"
 	}
@@ -69,6 +78,9 @@ func NewHTTPStaticServer(root string) *HTTPStaticServer {
 		Root:  root,
 		Theme: "black",
 		m:     m,
+		bufPool: sync.Pool{
+			New: func() interface{} { return make([]byte, 32*1024) },
+		},
 	}
 
 	go func() {
@@ -97,9 +109,24 @@ func (s *HTTPStaticServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.m.ServeHTTP(w, r)
 }
 
+// Return real path with Seperator(/)
+func (s *HTTPStaticServer) getRealPath(r *http.Request) string {
+	path := mux.Vars(r)["path"]
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	path = filepath.Clean(path) // prevent .. for safe issues
+	relativePath, err := filepath.Rel(s.Prefix, path)
+	if err != nil {
+		relativePath = path
+	}
+	realPath := filepath.Join(s.Root, relativePath)
+	return filepath.ToSlash(realPath)
+}
+
 func (s *HTTPStaticServer) hIndex(w http.ResponseWriter, r *http.Request) {
 	path := mux.Vars(r)["path"]
-	relPath := filepath.Join(s.Root, path)
+	realPath := s.getRealPath(r)
 	if r.FormValue("json") == "true" {
 		s.hJSONList(w, r)
 		return
@@ -115,15 +142,15 @@ func (s *HTTPStaticServer) hIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("GET", path, relPath)
-	if r.FormValue("raw") == "false" || isDir(relPath) {
+	log.Println("GET", path, realPath)
+	if r.FormValue("raw") == "false" || isDir(realPath) {
 		if r.Method == "HEAD" {
 			return
 		}
-		renderHTML(w, "index.html", s)
+		renderHTML(w, "assets/index.html", s)
 	} else {
 		if filepath.Base(path) == YAMLCONF {
-			auth := s.readAccessConf(path)
+			auth := s.readAccessConf(realPath)
 			if !auth.Delete {
 				http.Error(w, "Security warning, not allowed to read", http.StatusForbidden)
 				return
@@ -132,45 +159,26 @@ func (s *HTTPStaticServer) hIndex(w http.ResponseWriter, r *http.Request) {
 		if r.FormValue("download") == "true" {
 			w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(filepath.Base(path)))
 		}
-		http.ServeFile(w, r, relPath)
+		http.ServeFile(w, r, realPath)
 	}
-}
-
-func (s *HTTPStaticServer) hMkdir(w http.ResponseWriter, req *http.Request) {
-	path := filepath.Dir(mux.Vars(req)["path"])
-	auth := s.readAccessConf(path)
-	if !auth.canDelete(req) {
-		http.Error(w, "Mkdir forbidden", http.StatusForbidden)
-		return
-	}
-
-	name := filepath.Base(mux.Vars(req)["path"])
-	if err := checkFilename(name); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-	err := os.Mkdir(filepath.Join(s.Root, path, name), 0755)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	w.Write([]byte("Success"))
 }
 
 func (s *HTTPStaticServer) hDelete(w http.ResponseWriter, req *http.Request) {
-	// only can delete file now
 	path := mux.Vars(req)["path"]
-	auth := s.readAccessConf(path)
+	realPath := s.getRealPath(req)
+	// path = filepath.Clean(path) // for safe reason, prevent path contain ..
+	auth := s.readAccessConf(realPath)
 	if !auth.canDelete(req) {
 		http.Error(w, "Delete forbidden", http.StatusForbidden)
 		return
 	}
 
-	err := os.Remove(filepath.Join(s.Root, path))
+	// TODO: path safe check
+	err := os.RemoveAll(realPath)
 	if err != nil {
 		pathErr, ok := err.(*os.PathError)
-		if ok{
-			http.Error(w, pathErr.Op + " " + path + ": " + pathErr.Err.Error(), 500)
+		if ok {
+			http.Error(w, pathErr.Op+" "+path+": "+pathErr.Err.Error(), 500)
 		} else {
 			http.Error(w, err.Error(), 500)
 		}
@@ -180,11 +188,10 @@ func (s *HTTPStaticServer) hDelete(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *HTTPStaticServer) hUploadOrMkdir(w http.ResponseWriter, req *http.Request) {
-	path := mux.Vars(req)["path"]
-	dirpath := filepath.Join(s.Root, path)
+	dirpath := s.getRealPath(req)
 
 	// check auth
-	auth := s.readAccessConf(path)
+	auth := s.readAccessConf(dirpath)
 	if !auth.canUpload(req) {
 		http.Error(w, "Upload forbidden", http.StatusForbidden)
 		return
@@ -229,14 +236,33 @@ func (s *HTTPStaticServer) hUploadOrMkdir(w http.ResponseWriter, req *http.Reque
 	}
 
 	dstPath := filepath.Join(dirpath, filename)
+
+	// Large file (>32MB) will store in tmp directory
+	// The quickest operation is call os.Move instead of os.Copy
+	// Note: it seems not working well, os.Rename might be failed
+
+	var copyErr error
+	// if osFile, ok := file.(*os.File); ok && fileExists(osFile.Name()) {
+	// 	tmpUploadPath := osFile.Name()
+	// 	osFile.Close() // Windows can not rename opened file
+	// 	log.Printf("Move %s -> %s", tmpUploadPath, dstPath)
+	// 	copyErr = os.Rename(tmpUploadPath, dstPath)
+	// } else {
 	dst, err := os.Create(dstPath)
 	if err != nil {
 		log.Println("Create file:", err)
 		http.Error(w, "File create "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, file); err != nil {
+
+	// Note: very large size file might cause poor performance
+	// _, copyErr = io.Copy(dst, file)
+	buf := s.bufPool.Get().([]byte)
+	defer s.bufPool.Put(buf)
+	_, copyErr = io.CopyBuffer(dst, file, buf)
+	dst.Close()
+	// }
+	if copyErr != nil {
 		log.Println("Handle upload file:", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -246,7 +272,6 @@ func (s *HTTPStaticServer) hUploadOrMkdir(w http.ResponseWriter, req *http.Reque
 
 	if req.FormValue("unzip") == "true" {
 		err = unzipFile(dstPath, dirpath)
-		dst.Close()
 		os.Remove(dstPath)
 		message := "success"
 		if err != nil {
@@ -295,7 +320,7 @@ func parseApkInfo(path string) (ai *ApkInfo) {
 
 func (s *HTTPStaticServer) hInfo(w http.ResponseWriter, r *http.Request) {
 	path := mux.Vars(r)["path"]
-	relPath := filepath.Join(s.Root, path)
+	relPath := s.getRealPath(r)
 
 	fi, err := os.Stat(relPath)
 	if err != nil {
@@ -326,8 +351,7 @@ func (s *HTTPStaticServer) hInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPStaticServer) hZip(w http.ResponseWriter, r *http.Request) {
-	path := mux.Vars(r)["path"]
-	CompressToZip(w, filepath.Join(s.Root, path))
+	CompressToZip(w, s.getRealPath(r))
 }
 
 func (s *HTTPStaticServer) hUnzip(w http.ResponseWriter, r *http.Request) {
@@ -359,7 +383,7 @@ func (s *HTTPStaticServer) hPlist(w http.ResponseWriter, r *http.Request) {
 		path = path[0:len(path)-6] + ".ipa"
 	}
 
-	relPath := filepath.Join(s.Root, path)
+	relPath := s.getRealPath(r)
 	plinfo, err := parseIPA(relPath)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -404,7 +428,7 @@ func (s *HTTPStaticServer) hIpaLink(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html")
 	log.Println("PlistURL:", plistUrl)
-	renderHTML(w, "ipa-install.html", map[string]string{
+	renderHTML(w, "assets/ipa-install.html", map[string]string{
 		"Name":      filepath.Base(path),
 		"PlistLink": plistUrl,
 	})
@@ -439,8 +463,7 @@ func (s *HTTPStaticServer) genPlistLink(httpPlistLink string) (plistUrl string, 
 }
 
 func (s *HTTPStaticServer) hFileOrDirectory(w http.ResponseWriter, r *http.Request) {
-	path := mux.Vars(r)["path"]
-	http.ServeFile(w, r, filepath.Join(s.Root, path))
+	http.ServeFile(w, r, s.getRealPath(r))
 }
 
 type HTTPFileInfo struct {
@@ -543,9 +566,9 @@ func (c *AccessConf) canUpload(r *http.Request) bool {
 
 func (s *HTTPStaticServer) hJSONList(w http.ResponseWriter, r *http.Request) {
 	requestPath := mux.Vars(r)["path"]
-	localPath := filepath.Join(s.Root, requestPath)
+	realPath := s.getRealPath(r)
 	search := r.FormValue("search")
-	auth := s.readAccessConf(requestPath)
+	auth := s.readAccessConf(realPath)
 	auth.Upload = auth.canUpload(r)
 	auth.Delete = auth.canDelete(r)
 
@@ -563,7 +586,7 @@ func (s *HTTPStaticServer) hJSONList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		infos, err := ioutil.ReadDir(localPath)
+		infos, err := ioutil.ReadDir(realPath)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -592,7 +615,7 @@ func (s *HTTPStaticServer) hJSONList(w http.ResponseWriter, r *http.Request) {
 			lr.Name = filepath.ToSlash(name) // fix for windows
 		}
 		if info.IsDir() {
-			name := deepPath(localPath, info.Name())
+			name := deepPath(realPath, info.Name())
 			lr.Name = name
 			lr.Path = filepath.Join(filepath.Dir(path), name)
 			lr.Type = "dir"
@@ -612,7 +635,7 @@ func (s *HTTPStaticServer) hJSONList(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-var dirSizeMap = make(map[string]int64)
+var dirInfoSize = Directory{size: make(map[string]int64), mutex: &sync.RWMutex{}}
 
 func (s *HTTPStaticServer) makeIndex() error {
 	var indexes = make([]IndexFileItem, 0)
@@ -632,21 +655,28 @@ func (s *HTTPStaticServer) makeIndex() error {
 		return nil
 	})
 	s.indexes = indexes
-	dirSizeMap = make(map[string]int64)
 	return err
 }
 
 func (s *HTTPStaticServer) historyDirSize(dir string) int64 {
-	var size int64
-	if size, ok := dirSizeMap[dir]; ok {
+	dirInfoSize.mutex.RLock()
+	size, ok := dirInfoSize.size[dir]
+	dirInfoSize.mutex.RUnlock()
+
+	if ok {
 		return size
 	}
+
 	for _, fitem := range s.indexes {
 		if filepath.HasPrefix(fitem.Path, dir) {
 			size += fitem.Info.Size()
 		}
 	}
-	dirSizeMap[dir] = size
+
+	dirInfoSize.mutex.Lock()
+	dirInfoSize.size[dir] = size
+	dirInfoSize.mutex.Unlock()
+
 	return size
 }
 
@@ -683,19 +713,19 @@ func (s *HTTPStaticServer) defaultAccessConf() AccessConf {
 	}
 }
 
-func (s *HTTPStaticServer) readAccessConf(requestPath string) (ac AccessConf) {
-	requestPath = filepath.Clean(requestPath)
-	if requestPath == "/" || requestPath == "" || requestPath == "." {
+func (s *HTTPStaticServer) readAccessConf(realPath string) (ac AccessConf) {
+	relativePath, err := filepath.Rel(s.Root, realPath)
+	if err != nil || relativePath == "." || relativePath == "" { // actually relativePath is always "." if root == realPath
 		ac = s.defaultAccessConf()
+		realPath = s.Root
 	} else {
-		parentPath := filepath.Dir(requestPath)
+		parentPath := filepath.Dir(realPath)
 		ac = s.readAccessConf(parentPath)
 	}
-	relPath := filepath.Join(s.Root, requestPath)
-	if isFile(relPath) {
-		relPath = filepath.Dir(relPath)
+	if isFile(realPath) {
+		realPath = filepath.Dir(realPath)
 	}
-	cfgFile := filepath.Join(relPath, YAMLCONF)
+	cfgFile := filepath.Join(realPath, YAMLCONF)
 	data, err := ioutil.ReadFile(cfgFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -711,10 +741,9 @@ func (s *HTTPStaticServer) readAccessConf(requestPath string) (ac AccessConf) {
 }
 
 func deepPath(basedir, name string) string {
-	isDir := true
 	// loop max 5, incase of for loop not finished
 	maxDepth := 5
-	for depth := 0; depth <= maxDepth && isDir; depth += 1 {
+	for depth := 0; depth <= maxDepth; depth += 1 {
 		finfos, err := ioutil.ReadDir(filepath.Join(basedir, name))
 		if err != nil || len(finfos) != 1 {
 			break
@@ -726,16 +755,6 @@ func deepPath(basedir, name string) string {
 		}
 	}
 	return name
-}
-
-func isFile(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
-}
-
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsDir()
 }
 
 func assetsContent(name string) string {
@@ -776,7 +795,7 @@ var (
 	_tmpls = make(map[string]*template.Template)
 )
 
-func executeTemplate(w http.ResponseWriter, name string, v interface{}) {
+func renderHTML(w http.ResponseWriter, name string, v interface{}) {
 	if t, ok := _tmpls[name]; ok {
 		t.Execute(w, v)
 		return
@@ -784,16 +803,6 @@ func executeTemplate(w http.ResponseWriter, name string, v interface{}) {
 	t := template.Must(template.New(name).Funcs(funcMap).Delims("[[", "]]").Parse(assetsContent(name)))
 	_tmpls[name] = t
 	t.Execute(w, v)
-}
-
-func renderHTML(w http.ResponseWriter, name string, v interface{}) {
-	if _, ok := Assets.(http.Dir); ok {
-		log.Println("Hot load", name)
-		t := template.Must(template.New(name).Funcs(funcMap).Delims("[[", "]]").Parse(assetsContent(name)))
-		t.Execute(w, v)
-	} else {
-		executeTemplate(w, name, v)
-	}
 }
 
 func checkFilename(name string) error {
