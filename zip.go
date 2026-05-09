@@ -122,9 +122,13 @@ func ExtractFromZip(zipFile, path string, w io.Writer) (err error) {
 			err = er
 			return
 		}
-		defer rc.Close()
 		_, err = io.Copy(w, rc)
+		closeErr := rc.Close()
 		if err != nil {
+			return
+		}
+		if closeErr != nil {
+			err = closeErr
 			return
 		}
 		return
@@ -148,11 +152,11 @@ func unzipFile(filename, dest string) error {
 		if err != nil {
 			return err
 		}
-		defer rc.Close()
 
 		// ignore .ghs.yml
 		filename := sanitizedName(f.Name)
 		if filepath.Base(filename) == ".ghs.yml" {
+			rc.Close()
 			continue
 		}
 		fpath := filepath.Join(dest, filename)
@@ -179,9 +183,13 @@ func unzipFile(filename, dest string) error {
 		}
 		_, err = io.Copy(outFile, rc)
 		outFile.Close()
+		closeErr := rc.Close()
 
 		if err != nil {
 			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 	}
 	return nil

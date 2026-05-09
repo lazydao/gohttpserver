@@ -655,6 +655,9 @@ func (s *HTTPStaticServer) makeIndex() error {
 		return nil
 	})
 	s.indexes = indexes
+	dirInfoSize.mutex.Lock()
+	dirInfoSize.size = make(map[string]int64)
+	dirInfoSize.mutex.Unlock()
 	return err
 }
 
