@@ -1,11 +1,14 @@
-# gohttpserver
-[![Build Status](https://travis-ci.org/codeskyblue/gohttpserver.svg?branch=master)](https://travis-ci.org/codeskyblue/gohttpserver)
-[![Docker Automated build](https://img.shields.io/docker/automated/codeskyblue/gohttpserver)](https://hub.docker.com/repository/docker/codeskyblue/gohttpserver)
+# gohttpserver (not maintained)
 
+Alternatives
+
+- <https://github.com/sigoden/dufs> Writtern in Rust
+- <https://github.com/9001/copyparty> Writtern in Python
+- <https://github.com/codeskyblue/servefs> (A new port file server project)
+
+# doc
 - Goal: Make the best HTTP File Server.
 - Features: Human-friendly UI, file uploading support, direct QR-code generation for Apple & Android install package.
-
-[Demo site](https://gohttpserver.herokuapp.com/)
 
 - 目标: 做最好的HTTP文件服务器
 - 功能: 人性化的UI体验，文件的上传支持，安卓和苹果安装包的二维码直接生成。
@@ -91,7 +94,7 @@ Share current directory with http basic auth
 ```bash
 $ docker run -it --rm -p 8000:8000 -v $PWD:/app/public --name gohttpserver \
   codeskyblue/gohttpserver \
-  --auth-type http --auth-http username:password
+  --auth-type http --auth-http username1:password1 --auth-http username2:password2
 ```
 
 Share current directory with openid auth. (Works only in netease company.)
@@ -113,7 +116,7 @@ $ docker build -t codeskyblue/gohttpserver -f docker/Dockerfile .
 - Enable basic http authentication
 
   ```sh
-  $ gohttpserver --auth-type http --auth-http username:password
+  $ gohttpserver --auth-type http --auth-http username1:password1 --auth-http username2:password2
   ```
 
 - Use openid auth

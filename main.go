@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -33,7 +35,6 @@ type Configure struct {
 	HTTPAuth        string   `yaml:"httpauth"`
 	Cert            string   `yaml:"cert"`
 	Key             string   `yaml:"key"`
-	Cors            bool     `yaml:"cors"`
 	Theme           string   `yaml:"theme"`
 	XHeaders        bool     `yaml:"xheaders"`
 	Upload          bool     `yaml:"upload"`
@@ -43,12 +44,14 @@ type Configure struct {
 	Debug           bool     `yaml:"debug"`
 	GoogleTrackerID string   `yaml:"google-tracker-id"`
 	Auth            struct {
-		Type   string `yaml:"type"` // openid|http|github
-		OpenID string `yaml:"openid"`
-		HTTP   string `yaml:"http"`
-		ID     string `yaml:"id"`     // for oauth2
-		Secret string `yaml:"secret"` // for oauth2
+		Type   string   `yaml:"type"` // openid|http|github
+		OpenID string   `yaml:"openid"`
+		HTTP   []string `yaml:"http"`
+		ID     string   `yaml:"id"`     // for oauth2
+		Secret string   `yaml:"secret"` // for oauth2
 	} `yaml:"auth"`
+	DeepPathMaxDepth int  `yaml:"deep-path-max-depth"`
+	NoIndex          bool `yaml:"no-index"`
 }
 
 type httpLogger struct{}
@@ -99,6 +102,8 @@ func parseFlags() error {
 	gcfg.Auth.OpenID = defaultOpenID
 	gcfg.GoogleTrackerID = "UA-81205425-2"
 	gcfg.Title = "Go HTTP File Server"
+	gcfg.DeepPathMaxDepth = 5
+	gcfg.NoIndex = false
 
 	kingpin.HelpFlag.Short('h')
 	kingpin.Version(versionMessage())
@@ -110,17 +115,18 @@ func parseFlags() error {
 	kingpin.Flag("cert", "tls cert.pem path").StringVar(&gcfg.Cert)
 	kingpin.Flag("key", "tls key.pem path").StringVar(&gcfg.Key)
 	kingpin.Flag("auth-type", "Auth type <http|openid>").StringVar(&gcfg.Auth.Type)
-	kingpin.Flag("auth-http", "HTTP basic auth (ex: user:pass)").StringVar(&gcfg.Auth.HTTP)
+	kingpin.Flag("auth-http", "HTTP basic auth (ex: user:pass)").StringsVar(&gcfg.Auth.HTTP)
 	kingpin.Flag("auth-openid", "OpenID auth identity url").StringVar(&gcfg.Auth.OpenID)
 	kingpin.Flag("theme", "web theme, one of <black|green>").StringVar(&gcfg.Theme)
 	kingpin.Flag("upload", "enable upload support").BoolVar(&gcfg.Upload)
 	kingpin.Flag("delete", "enable delete support").BoolVar(&gcfg.Delete)
 	kingpin.Flag("xheaders", "used when behide nginx").BoolVar(&gcfg.XHeaders)
-	kingpin.Flag("cors", "enable cross-site HTTP request").BoolVar(&gcfg.Cors)
 	kingpin.Flag("debug", "enable debug mode").BoolVar(&gcfg.Debug)
 	kingpin.Flag("plistproxy", "plist proxy when server is not https").Short('p').StringVar(&gcfg.PlistProxy)
 	kingpin.Flag("title", "server title").StringVar(&gcfg.Title)
 	kingpin.Flag("google-tracker-id", "set to empty to disable it").StringVar(&gcfg.GoogleTrackerID)
+	kingpin.Flag("deep-path-max-depth", "set to -1 to not combine dirs").IntVar(&gcfg.DeepPathMaxDepth)
+	kingpin.Flag("no-index", "disable indexing").BoolVar(&gcfg.NoIndex)
 
 	kingpin.Parse() // first parse conf
 
@@ -148,6 +154,41 @@ func fixPrefix(prefix string) string {
 	return prefix
 }
 
+func cors(next http.Handler) http.Handler {
+	// access control and CORS middleware
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func multiBasicAuth(auths []string) func(http.Handler) http.Handler {
+	userPassMap := make(map[string]string)
+	for _, auth := range auths {
+		userpass := strings.SplitN(auth, ":", 2)
+		if len(userpass) == 2 {
+			userPassMap[userpass[0]] = userpass[1]
+		}
+	}
+	return httpauth.BasicAuth(httpauth.AuthOptions{
+		Realm: "Restricted",
+		AuthFunc: func(user, pass string, request *http.Request) bool {
+			password, ok := userPassMap[user]
+			if !ok {
+				return false
+			}
+			givenPass := sha256.Sum256([]byte(pass))
+			requiredPass := sha256.Sum256([]byte(password))
+			return subtle.ConstantTimeCompare(givenPass[:], requiredPass[:]) == 1
+		},
+	})
+}
+
 func main() {
 	if err := parseFlags(); err != nil {
 		log.Fatal(err)
@@ -164,7 +205,7 @@ func main() {
 		log.Printf("url prefix: %s", gcfg.Prefix)
 	}
 
-	ss := NewHTTPStaticServer(gcfg.Root)
+	ss := NewHTTPStaticServer(gcfg.Root, gcfg.NoIndex)
 	ss.Prefix = gcfg.Prefix
 	ss.Theme = gcfg.Theme
 	ss.Title = gcfg.Title
@@ -172,6 +213,7 @@ func main() {
 	ss.Upload = gcfg.Upload
 	ss.Delete = gcfg.Delete
 	ss.AuthType = gcfg.Auth.Type
+	ss.DeepPathMaxDepth = gcfg.DeepPathMaxDepth
 
 	if gcfg.PlistProxy != "" {
 		u, err := url.Parse(gcfg.PlistProxy)
@@ -190,13 +232,9 @@ func main() {
 	hdlr = accesslog.NewLoggingHandler(hdlr, logger)
 
 	// HTTP Basic Authentication
-	userpass := strings.SplitN(gcfg.Auth.HTTP, ":", 2)
 	switch gcfg.Auth.Type {
 	case "http":
-		if len(userpass) == 2 {
-			user, pass := userpass[0], userpass[1]
-			hdlr = httpauth.SimpleBasicAuth(user, pass)(hdlr)
-		}
+		hdlr = multiBasicAuth(gcfg.Auth.HTTP)(hdlr)
 	case "openid":
 		handleOpenID(gcfg.Auth.OpenID, false) // FIXME(ssx): set secure default to false
 		// case "github":
@@ -206,9 +244,8 @@ func main() {
 	}
 
 	// CORS
-	if gcfg.Cors {
-		hdlr = handlers.CORS()(hdlr)
-	}
+	hdlr = cors(hdlr)
+
 	if gcfg.XHeaders {
 		hdlr = handlers.ProxyHeaders(hdlr)
 	}

@@ -48,22 +48,24 @@ type Directory struct {
 }
 
 type HTTPStaticServer struct {
-	Root            string
-	Prefix          string
-	Upload          bool
-	Delete          bool
-	Title           string
-	Theme           string
-	PlistProxy      string
-	GoogleTrackerID string
-	AuthType        string
+	Root             string
+	Prefix           string
+	Upload           bool
+	Delete           bool
+	Title            string
+	Theme            string
+	PlistProxy       string
+	GoogleTrackerID  string
+	AuthType         string
+	DeepPathMaxDepth int
+	NoIndex          bool
 
 	indexes []IndexFileItem
 	m       *mux.Router
 	bufPool sync.Pool // use sync.Pool caching buf to reduce gc ratio
 }
 
-func NewHTTPStaticServer(root string) *HTTPStaticServer {
+func NewHTTPStaticServer(root string, noIndex bool) *HTTPStaticServer {
 	// if root == "" {
 	// 	root = "./"
 	// }
@@ -81,23 +83,27 @@ func NewHTTPStaticServer(root string) *HTTPStaticServer {
 		bufPool: sync.Pool{
 			New: func() interface{} { return make([]byte, 32*1024) },
 		},
+		NoIndex: noIndex,
 	}
 
-	go func() {
-		time.Sleep(1 * time.Second)
-		for {
-			startTime := time.Now()
-			log.Println("Started making search index")
-			s.makeIndex()
-			log.Printf("Completed search index in %v", time.Since(startTime))
-			//time.Sleep(time.Second * 1)
-			time.Sleep(time.Minute * 10)
-		}
-	}()
+	if !noIndex {
+		go func() {
+			time.Sleep(1 * time.Second)
+			for {
+				startTime := time.Now()
+				log.Println("Started making search index")
+				s.makeIndex()
+				log.Printf("Completed search index in %v", time.Since(startTime))
+				//time.Sleep(time.Second * 1)
+				time.Sleep(time.Minute * 10)
+			}
+		}()
+	}
 
 	// routers for Apple *.ipa
 	m.HandleFunc("/-/ipa/plist/{path:.*}", s.hPlist)
 	m.HandleFunc("/-/ipa/link/{path:.*}", s.hIpaLink)
+	m.HandleFunc("/-/video-player/{path:.*}", s.hVideoPlayer)
 
 	m.HandleFunc("/{path:.*}", s.hIndex).Methods("GET", "HEAD")
 	m.HandleFunc("/{path:.*}", s.hUploadOrMkdir).Methods("POST")
@@ -571,6 +577,7 @@ func (s *HTTPStaticServer) hJSONList(w http.ResponseWriter, r *http.Request) {
 	auth := s.readAccessConf(realPath)
 	auth.Upload = auth.canUpload(r)
 	auth.Delete = auth.canDelete(r)
+	maxDepth := s.DeepPathMaxDepth
 
 	// path string -> info os.FileInfo
 	fileInfoMap := make(map[string]os.FileInfo, 0)
@@ -615,7 +622,7 @@ func (s *HTTPStaticServer) hJSONList(w http.ResponseWriter, r *http.Request) {
 			lr.Name = filepath.ToSlash(name) // fix for windows
 		}
 		if info.IsDir() {
-			name := deepPath(realPath, info.Name())
+			name := deepPath(realPath, info.Name(), maxDepth)
 			lr.Name = name
 			lr.Path = filepath.Join(filepath.Dir(path), name)
 			lr.Type = "dir"
@@ -740,9 +747,8 @@ func (s *HTTPStaticServer) readAccessConf(realPath string) (ac AccessConf) {
 	return
 }
 
-func deepPath(basedir, name string) string {
+func deepPath(basedir, name string, maxDepth int) string {
 	// loop max 5, incase of for loop not finished
-	maxDepth := 5
 	for depth := 0; depth <= maxDepth; depth += 1 {
 		finfos, err := ioutil.ReadDir(filepath.Join(basedir, name))
 		if err != nil || len(finfos) != 1 {
@@ -810,4 +816,29 @@ func checkFilename(name string) error {
 		return errors.New("Name should not contains \\/:*<>|")
 	}
 	return nil
+}
+
+func (s *HTTPStaticServer) hVideoPlayer(w http.ResponseWriter, r *http.Request) {
+	path := mux.Vars(r)["path"]
+	realPath := s.getRealPath(r)
+	extension := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+
+	if _, err := os.Stat(realPath); os.IsNotExist(err) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	fileName := filepath.Base(path)
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	videoURL := fmt.Sprintf("%s://%s/%s", scheme, r.Host, path)
+
+	renderHTML(w, "assets/video-player.html", map[string]interface{}{
+		"FileName":  fileName,
+		"VideoURL":  videoURL,
+		"Extension": extension,
+	})
 }
